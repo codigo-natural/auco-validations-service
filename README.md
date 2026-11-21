@@ -1,6 +1,6 @@
 # AUCO Validations
 
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/codigo-natural/auco-validations-service/actions/workflows/ci.yml/badge.svg)](https://github.com/codigo-natural/auco-validations-service/actions/workflows/ci.yml)
 
 Servicio en Node.js que registra validaciones de identidad (nombre y documento), las enriquece con datos del país consultando una API pública, las guarda en MongoDB y escribe un evento de auditoría en DynamoDB.
 Además calcula una señal de riesgo: cuántas veces se intentó validar el mismo documento en las últimas 24 horas.
@@ -160,3 +160,39 @@ aws dynamodb query \
 ```
 
 ## Respuestas de la entrega
+
+### 1. Cómo usé la IA
+
+Usé Claude en dos pasos. Primero para planear: le pedí un prompt con las decisiones ya cerradas capa por capa (stack, estructura de carpetas, formato de las llaves de DynamoDB, qué hace el servicio si falla la API externa o la auditoría) y una lista explícita de lo que no se debía hacer, para evitar sobreingeniería. Después usé Claude Code para implementarlo en seis fases, con revisión mía y un commit por fase antes de avanzar. Lo que hubo que corregir o decidir sobre la marcha:
+
+- La API sugerida (restcountries v3.1) está deprecada y la v5 exige API key; cambié al Banco Mundial.
+- El Banco Mundial responde 200 ante un código desconocido y devuelve agregados regionales (como EU) que no son países; ambos casos se tratan como `NOT_FOUND`.
+- `insertOne` de Mongo muta el objeto que recibe (le agrega `_id`), así que se inserta una copia.
+- Si el primer intento de auditoría sí llegó a Dynamo pero el reintento falla por la condición `attribute_not_exists`, ese caso cuenta como ya registrado y no como error.
+- La regex del nombre producía dos errores redundantes con un nombre vacío; ahora solo se reporta la longitud mínima.
+
+La IA acelera el código, pero las decisiones de consistencia (compensación entre Mongo y Dynamo), de llaves y de qué hacer cuando falla un tercero las definí yo antes de generar nada, porque son las que tienen impacto en producción.
+
+### 2. Por qué elegí esas llaves en DynamoDB
+
+`pk = DOC#{documento}` y `sk = {createdAt ISO 8601 UTC}#{validationId}`.
+
+- **Patrón de acceso:** la pregunta que importa en antifraude es "qué ha pasado con este documento en un rango de fechas". Con esas llaves es una sola `Query` por `pk` con `sk BETWEEN`, sin `Scan` ni índices secundarios.
+- **Orden:** ISO 8601 en UTC ordena cronológicamente como texto, así que el rango por fecha funciona directo sobre la sort key.
+- **Sin colisiones:** el sufijo `validationId` evita que dos eventos del mismo documento en el mismo milisegundo compartan llave. Con solo la fecha del día, `PutItem` sobrescribiría eventos y se perdería historial de auditoría. Además `attribute_not_exists(pk)` garantiza que un evento nunca se pise.
+- **Distribución:** el documento tiene alta cardinalidad, así que las particiones quedan repartidas.
+- **Lo que habilita:** la señal de riesgo cuenta los intentos del mismo documento en las últimas 24 horas con esa misma `Query`.
+
+### 3. Qué mejoraría con más tiempo
+
+Ordenado por impacto:
+
+1. **Consistencia:** reemplazar la compensación por un patrón outbox o por Change Streams de Mongo, con reintentos garantizados para la auditoría.
+2. **Idempotencia:** aceptar un header `Idempotency-Key` en el POST para evitar duplicados por reintentos del cliente.
+3. **Datos personales:** guardar el documento en Dynamo como HMAC-SHA256 con la llave en KMS o Secrets Manager, y cifrar en reposo los campos sensibles en Mongo (Ley 1581).
+4. **Señal de riesgo:** usar contadores atómicos por documento y por hora (`UpdateItem` con `ADD`) y sumar las últimas 24 para eliminar la condición de carrera entre peticiones simultáneas, con umbrales y ventanas configurables por cliente y un endpoint de historial por documento.
+5. **Resiliencia:** circuit breaker para la API externa, caché del enriquecimiento por país y re-enriquecimiento en segundo plano de los registros que quedaron en `failed`.
+6. **Despliegue:** adaptar cada endpoint a un handler de Lambda reutilizando el mismo servicio, con Serverless Framework o SAM, API Gateway, DynamoDB real y MongoDB Atlas.
+7. **Seguridad del API:** autenticación por API key o JWT por cliente, rate limiting y helmet.
+8. **Calidad:** pruebas de integración con Testcontainers contra Mongo y Dynamo reales, y contrato OpenAPI.
+9. **Observabilidad:** logs estructurados con pino, correlation id por request, métricas y alarmas en CloudWatch.
