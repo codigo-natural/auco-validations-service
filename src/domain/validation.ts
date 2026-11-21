@@ -1,18 +1,11 @@
 export type EnrichmentFailureReason =
   'TIMEOUT' | 'NOT_FOUND' | 'UPSTREAM_ERROR' | 'INVALID_RESPONSE';
 
-export interface Currency {
-  code: string;
-  name: string;
-  symbol?: string;
-}
-
 export interface CountryInfo {
   name: string;
-  officialName: string;
   region: string;
-  capital: string[];
-  currencies: Currency[];
+  capital: string | null;
+  incomeLevel: string;
 }
 
 export type Enrichment =
