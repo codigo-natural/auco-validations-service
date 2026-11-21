@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { AppError, type ErrorCode } from '../errors/app-error.js';
 
 // Letras de cualquier alfabeto (incluye tildes, ñ y ü), espacios, apóstrofo y guion.
-const NAME_REGEX = /^[\p{L}' -]+$/u;
+const NAME_REGEX = /^[\p{L}' -]*$/u;
 
 export const createValidationSchema = z.object({
   name: z
