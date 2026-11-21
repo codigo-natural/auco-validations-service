@@ -4,11 +4,16 @@ import type {
   CountriesClient,
   Enrichment,
   NewValidation,
+  RiskSignal,
   Validation,
   ValidationRepository,
 } from '../domain/validation.js';
 import { AppError } from '../errors/app-error.js';
 import { ExternalApiError } from '../errors/external-api-error.js';
+
+const RISK_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Con 3 o más intentos previos del mismo documento en 24 h, la validación se marca para revisión. */
+export const RISK_FLAG_THRESHOLD = 3;
 
 export interface CreateValidationInput {
   name: string;
@@ -26,9 +31,10 @@ export class ValidationService {
   constructor(private readonly deps: ValidationServiceDeps) {}
 
   async create(input: CreateValidationInput): Promise<string> {
-    const enrichment = await this.enrich(input.country);
     const createdAt = new Date();
-    const record: NewValidation = { ...input, enrichment, createdAt };
+    const risk = await this.assessRisk(input.documentNumber, createdAt);
+    const enrichment = await this.enrich(input.country);
+    const record: NewValidation = { ...input, enrichment, risk, createdAt };
 
     let id: string;
     try {
@@ -63,6 +69,20 @@ export class ValidationService {
     const validation = await this.deps.validations.findById(id);
     if (!validation) throw new AppError(404, 'NOT_FOUND', 'Validación no encontrada');
     return validation;
+  }
+
+  // Usa el patrón de acceso de la tabla de auditoría: Query por DOC# con sk BETWEEN.
+  // Si Dynamo no responde se corta aquí: sin Dynamo tampoco se podría auditar.
+  private async assessRisk(documentNumber: string, now: Date): Promise<RiskSignal> {
+    let previousAttempts24h: number;
+    try {
+      const since = new Date(now.getTime() - RISK_WINDOW_MS);
+      previousAttempts24h = await this.deps.audit.countBetween(documentNumber, since, now);
+    } catch (error) {
+      logFailure('No se pudo consultar el historial de auditoría', error);
+      throw persistenceError();
+    }
+    return { previousAttempts24h, flagged: previousAttempts24h >= RISK_FLAG_THRESHOLD };
   }
 
   private async enrich(countryCode: string): Promise<Enrichment> {

@@ -1,5 +1,5 @@
 import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
-import { PutCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { PutCommand, QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import type { AuditEvent, AuditRepository } from '../domain/validation.js';
 
 export interface AuditItem {
@@ -32,6 +32,15 @@ export function toAuditItem(event: AuditEvent): AuditItem {
   };
 }
 
+/**
+ * Rango de llaves para "historial de un documento entre dos fechas".
+ * El límite superior termina en '~' (mayor que '#' y que los dígitos hex del id) para incluir
+ * todos los eventos cuyo createdAt sea exactamente `to`.
+ */
+export function auditKeyRange(documentNumber: string, from: Date, to: Date) {
+  return { pk: `DOC#${documentNumber}`, skFrom: from.toISOString(), skTo: `${to.toISOString()}~` };
+}
+
 export class DynamoAuditRepository implements AuditRepository {
   constructor(
     private readonly docClient: DynamoDBDocumentClient,
@@ -54,5 +63,26 @@ export class DynamoAuditRepository implements AuditRepository {
       if (error instanceof ConditionalCheckFailedException) return;
       throw error;
     }
+  }
+
+  async countBetween(documentNumber: string, from: Date, to: Date): Promise<number> {
+    const { pk, skFrom, skTo } = auditKeyRange(documentNumber, from, to);
+    let count = 0;
+    let startKey: Record<string, unknown> | undefined;
+    // Select COUNT no trae los ítems, pero Dynamo pagina cada 1MB leído: se suman todas las páginas.
+    do {
+      const page = await this.docClient.send(
+        new QueryCommand({
+          TableName: this.tableName,
+          KeyConditionExpression: 'pk = :pk AND sk BETWEEN :from AND :to',
+          ExpressionAttributeValues: { ':pk': pk, ':from': skFrom, ':to': skTo },
+          Select: 'COUNT',
+          ExclusiveStartKey: startKey,
+        }),
+      );
+      count += page.Count ?? 0;
+      startKey = page.LastEvaluatedKey;
+    } while (startKey);
+    return count;
   }
 }

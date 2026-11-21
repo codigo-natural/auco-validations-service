@@ -33,6 +33,7 @@ function toResponse(validation: Validation) {
     documentNumber: validation.documentNumber,
     country: validation.country,
     enrichment: validation.enrichment,
+    risk: validation.risk,
     createdAt: validation.createdAt.toISOString(),
   };
 }

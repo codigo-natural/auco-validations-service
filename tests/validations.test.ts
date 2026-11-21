@@ -2,7 +2,8 @@ import request from 'supertest';
 import { beforeEach, describe, expect, it, test, vi } from 'vitest';
 import { ExternalApiError } from '../src/errors/external-api-error.js';
 import { createApp } from '../src/http/app.js';
-import { ValidationService } from '../src/services/validation.service.js';
+import { toAuditItem } from '../src/repositories/dynamo-audit.repository.js';
+import { RISK_FLAG_THRESHOLD, ValidationService } from '../src/services/validation.service.js';
 import {
   COLOMBIA,
   FakeCountriesClient,
@@ -166,7 +167,69 @@ describe('GET /validations/:id', () => {
       documentNumber: '1234567',
       country: 'CO',
       enrichment: { status: 'completed', country: COLOMBIA },
+      risk: { previousAttempts24h: 0, flagged: false },
       createdAt: validations.records.get(created.id)!.createdAt.toISOString(),
     });
+  });
+});
+
+describe('Señal de riesgo por intentos repetidos', () => {
+  const HOUR = 60 * 60 * 1000;
+
+  function pastEvent(documentNumber: string, msAgo: number, validationId: string) {
+    return toAuditItem({
+      eventType: 'VALIDATION_CREATED',
+      validationId,
+      documentNumber,
+      country: 'CO',
+      enrichmentStatus: 'completed',
+      createdAt: new Date(Date.now() - msAgo),
+    });
+  }
+
+  it('cuenta los intentos previos del documento y marca la validación al llegar al umbral', async () => {
+    const { app, validations } = setup();
+    const risks = [];
+
+    for (let i = 0; i <= RISK_FLAG_THRESHOLD; i++) {
+      const res = await request(app).post('/validations').send(validBody);
+      expect(res.status).toBe(201);
+      risks.push(validations.records.get(res.body.id)?.risk);
+    }
+
+    expect(risks).toEqual([
+      { previousAttempts24h: 0, flagged: false },
+      { previousAttempts24h: 1, flagged: false },
+      { previousAttempts24h: 2, flagged: false },
+      { previousAttempts24h: 3, flagged: true },
+    ]);
+  });
+
+  it('ignora eventos de más de 24 horas y de otros documentos', async () => {
+    const { app, validations, audit } = setup();
+    audit.items.push(
+      pastEvent('1234567', 25 * HOUR, 'a'.repeat(24)), // fuera de la ventana
+      pastEvent('1234567', 23 * HOUR, 'b'.repeat(24)), // dentro de la ventana
+      pastEvent('7654321', 1 * HOUR, 'c'.repeat(24)), // otro documento
+    );
+
+    const res = await request(app).post('/validations').send(validBody);
+
+    expect(validations.records.get(res.body.id)?.risk).toEqual({
+      previousAttempts24h: 1,
+      flagged: false,
+    });
+  });
+
+  it('responde 503 sin guardar nada si no puede consultar el historial', async () => {
+    const { app, validations, audit } = setup();
+    audit.failQueries = true;
+
+    const res = await request(app).post('/validations').send(validBody);
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('PERSISTENCE_ERROR');
+    expect(validations.records.size).toBe(0);
+    expect(audit.items).toHaveLength(0);
   });
 });

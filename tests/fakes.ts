@@ -8,7 +8,11 @@ import type {
   Validation,
   ValidationRepository,
 } from '../src/domain/validation.js';
-import { toAuditItem, type AuditItem } from '../src/repositories/dynamo-audit.repository.js';
+import {
+  auditKeyRange,
+  toAuditItem,
+  type AuditItem,
+} from '../src/repositories/dynamo-audit.repository.js';
 
 export class InMemoryValidationRepository implements ValidationRepository {
   readonly records = new Map<string, NewValidation>();
@@ -34,6 +38,7 @@ export class InMemoryAuditRepository implements AuditRepository {
   readonly items: AuditItem[] = [];
   attempts = 0;
   failuresLeft = 0;
+  failQueries = false;
 
   async record(event: AuditEvent): Promise<void> {
     this.attempts++;
@@ -42,6 +47,14 @@ export class InMemoryAuditRepository implements AuditRepository {
       throw new Error('Dynamo no disponible');
     }
     this.items.push(toAuditItem(event));
+  }
+
+  /** Misma semántica que el Query de Dynamo: pk exacta y sk BETWEEN (comparación de strings). */
+  async countBetween(documentNumber: string, from: Date, to: Date): Promise<number> {
+    if (this.failQueries) throw new Error('Dynamo no disponible');
+    const { pk, skFrom, skTo } = auditKeyRange(documentNumber, from, to);
+    return this.items.filter((item) => item.pk === pk && item.sk >= skFrom && item.sk <= skTo)
+      .length;
   }
 }
 

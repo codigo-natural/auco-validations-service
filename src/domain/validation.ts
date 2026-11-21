@@ -12,11 +12,18 @@ export type Enrichment =
   | { status: 'completed'; country: CountryInfo }
   | { status: 'failed'; reason: EnrichmentFailureReason };
 
+export interface RiskSignal {
+  /** Eventos de auditoría del mismo documento en las 24 horas previas a esta validación. */
+  previousAttempts24h: number;
+  flagged: boolean;
+}
+
 export interface NewValidation {
   name: string;
   documentNumber: string;
   country: string;
   enrichment: Enrichment;
+  risk: RiskSignal;
   createdAt: Date;
 }
 
@@ -41,6 +48,8 @@ export interface ValidationRepository {
 
 export interface AuditRepository {
   record(event: AuditEvent): Promise<void>;
+  /** Cuenta los eventos de un documento con createdAt en [from, to]. */
+  countBetween(documentNumber: string, from: Date, to: Date): Promise<number>;
 }
 
 export interface CountriesClient {
