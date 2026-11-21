@@ -1,3 +1,4 @@
+import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 import { PutCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import type { AuditEvent, AuditRepository } from '../domain/validation.js';
 
@@ -38,13 +39,20 @@ export class DynamoAuditRepository implements AuditRepository {
   ) {}
 
   async record(event: AuditEvent): Promise<void> {
-    await this.docClient.send(
-      new PutCommand({
-        TableName: this.tableName,
-        Item: toAuditItem(event),
-        // Un evento de auditoría nunca se sobrescribe.
-        ConditionExpression: 'attribute_not_exists(pk)',
-      }),
-    );
+    try {
+      await this.docClient.send(
+        new PutCommand({
+          TableName: this.tableName,
+          Item: toAuditItem(event),
+          // Un evento de auditoría nunca se sobrescribe.
+          ConditionExpression: 'attribute_not_exists(pk)',
+        }),
+      );
+    } catch (error) {
+      // La sk incluye el validationId: si ya existe, es este mismo evento (p. ej. un reintento
+      // cuyo primer intento sí se escribió). Se considera registrado, no se sobrescribe.
+      if (error instanceof ConditionalCheckFailedException) return;
+      throw error;
+    }
   }
 }
