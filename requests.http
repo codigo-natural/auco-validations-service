@@ -1,0 +1,94 @@
+# Casos listos para la extensión REST Client de VS Code (o el cliente HTTP de JetBrains).
+# Requiere la app corriendo: npm run dev
+
+@baseUrl = http://localhost:3000
+@json = application/json
+
+### Health
+GET {{baseUrl}}/health
+
+### POST válido: normaliza el nombre, el documento (1.234.567 -> 1234567) y el país (co -> CO)
+# @name create
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "  José   Pérez ",
+  "documentNumber": "1.234.567",
+  "country": "co"
+}
+
+### GET del registro recién creado (ejecuta primero el POST anterior)
+GET {{baseUrl}}/validations/{{create.response.body.id}}
+
+### POST sin country: por defecto CO
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "María Ñúñez-O'Connor",
+  "documentNumber": "52 123 456"
+}
+
+### POST con país inexistente: 201 con enrichment.status = failed (NOT_FOUND)
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "Ana Ruiz",
+  "documentNumber": "87654321",
+  "country": "ZZ"
+}
+
+### Señal de riesgo: envía este POST 4 veces; desde la cuarta, risk.flagged = true
+# @name repeated
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "Carlos Gómez",
+  "documentNumber": "1.020.304.050"
+}
+
+### GET del último intento repetido: revisa risk.previousAttempts24h
+GET {{baseUrl}}/validations/{{repeated.response.body.id}}
+
+### 400: documento con letras
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "José Pérez",
+  "documentNumber": "12ab5678"
+}
+
+### 400: nombre vacío
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "",
+  "documentNumber": "1234567"
+}
+
+### 400: country de tres letras
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{
+  "name": "José Pérez",
+  "documentNumber": "1234567",
+  "country": "COL"
+}
+
+### 400: JSON mal formado
+POST {{baseUrl}}/validations
+Content-Type: {{json}}
+
+{ "name": "José"
+
+### 400: id mal formado (ObjectId.isValid aceptaría este string de 12 caracteres)
+GET {{baseUrl}}/validations/123456789012
+
+### 404: id con formato válido que no existe
+GET {{baseUrl}}/validations/000000000000000000000000

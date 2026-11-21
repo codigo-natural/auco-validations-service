@@ -1,7 +1,9 @@
 # AUCO Validations
 
+[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+
 Servicio en Node.js que registra validaciones de identidad (nombre y documento), las enriquece con datos del país consultando una API pública, las guarda en MongoDB y escribe un evento de auditoría en DynamoDB.
-Expone `POST /validations` para crear y `GET /validations/:id` para consultar.
+Además calcula una señal de riesgo: cuántas veces se intentó validar el mismo documento en las últimas 24 horas.
 
 ## Requisitos
 
@@ -21,6 +23,8 @@ npm run dev        # http://localhost:3000
 Las credenciales `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` del `.env` son dummy, pero obligatorias: sin ellas DynamoDB Local falla con un error confuso. DynamoDB Local corre en memoria, así que si reinicias el contenedor debes volver a ejecutar `npm run db:setup`.
 
 ## Ejemplos
+
+Todos los casos (válidos, inválidos, riesgo, 400 y 404) están listos en [`requests.http`](requests.http) para la extensión REST Client de VS Code o el cliente HTTP de JetBrains.
 
 **POST válido** (201, con header `Location: /validations/{id}`):
 
@@ -77,6 +81,7 @@ curl http://localhost:3000/validations/6b01111ed9073c3371852781
       "incomeLevel": "Upper middle income"
     }
   },
+  "risk": { "previousAttempts24h": 0, "flagged": false },
   "createdAt": "2026-11-21T03:33:50.431Z"
 }
 ```
@@ -91,16 +96,55 @@ Todos los errores tienen la forma `{ error: { code, message, details? } }`, con 
 npm test
 ```
 
-No necesitan Docker ni red: `createApp` recibe las dependencias, y las pruebas le inyectan repositorios en memoria y un cliente de países fake. El cliente HTTP se prueba con un `fetch` stub.
+No necesitan Docker ni red: `createApp` recibe las dependencias, y las pruebas le inyectan repositorios en memoria y un cliente de países fake. El cliente HTTP se prueba con un `fetch` stub. GitHub Actions corre lint, pruebas y build en cada push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+## Flujo de POST /validations
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant A as API
+    participant D as DynamoDB
+    participant W as API Banco Mundial
+    participant M as MongoDB
+
+    C->>A: POST /validations
+    A->>A: Validar y normalizar con zod
+    alt body inválido
+        A-->>C: 400 VALIDATION_ERROR
+    end
+    A->>D: Query pk = DOC#doc, sk BETWEEN hace 24 h y ahora
+    D-->>A: previousAttempts24h, flagged si es 3 o más
+    A->>W: GET /country/iso2 con timeout y 1 reintento
+    W-->>A: país o error, enrichment completed o failed
+    A->>M: insertOne de la validación
+    M-->>A: id
+    A->>D: PutItem del evento con attribute_not_exists y 1 reintento
+    alt la auditoría falla dos veces
+        A->>M: deleteOne(id) como compensación
+        A-->>C: 503 PERSISTENCE_ERROR
+    else auditoría escrita
+        A-->>C: 201 con id y header Location
+    end
+```
+
+## Señal de riesgo
+
+Antes de crear la validación se hace un `Query` a la tabla de auditoría por `pk = DOC#{documento}` con `sk BETWEEN {hace 24 h} AND {ahora}` y `Select: COUNT`. El resultado se guarda en el registro como `risk: { previousAttempts24h, flagged }`, donde `flagged` es `true` desde el tercer intento previo. Varios intentos con el mismo documento en poco tiempo son una señal típica de fraude (prueba de identidades robadas, insistencia tras un rechazo), y esta consulta es justo el patrón de acceso para el que se diseñaron las llaves. La validación no se bloquea: se marca para que el negocio decida. Si Dynamo no responde, se devuelve 503 antes de escribir nada, porque sin Dynamo tampoco se podría auditar.
 
 ## Decisiones de diseño
 
-- **Express y no NestJS:** es un servicio de dos endpoints; Express mantiene poco código y queda cerca de lo que sería un handler de Lambda. Las dependencias se inyectan a mano en `src/server.ts` (composition root).
-- **API externa:** el enunciado sugería restcountries, pero su v3.1 fue retirada (responde siempre un error de deprecación) y la v5 exige API key. Se usa la API pública del Banco Mundial (`api.worldbank.org/v2/country/{iso2}`), gratuita y sin registro, que aporta nombre, región, capital y nivel de ingreso.
-- **Si falla la API externa:** la validación se crea igual con `enrichment: { status: "failed", reason }` (`TIMEOUT`, `NOT_FOUND`, `UPSTREAM_ERROR` o `INVALID_RESPONSE`). La caída de un tercero no bloquea el negocio. Cada llamada tiene timeout y un único reintento (300 ms) solo ante error de red, timeout, 5xx o 429.
-- **Consistencia Mongo/Dynamo:** no hay transacción distribuida. Se inserta en Mongo, luego se audita en Dynamo con un reintento; si vuelve a fallar se borra el documento de Mongo (compensación) y se responde 503 `PERSISTENCE_ERROR`. Nunca queda una validación sin auditoría.
-- **Llaves de DynamoDB:** `pk = DOC#{documento}` y `sk = {createdAt ISO 8601 UTC}#{validationId}`. El patrón de acceso es "historial de un documento en un rango de fechas" (`Query` por `pk` con `sk BETWEEN`), útil para detectar intentos repetidos con el mismo documento, una señal típica de fraude. ISO 8601 ordena cronológicamente como texto, y el sufijo `validationId` evita colisiones si dos eventos del mismo documento caen en el mismo milisegundo (con solo la fecha, `PutItem` sobrescribiría eventos). El `PutItem` usa `attribute_not_exists(pk)` para que un evento nunca se sobrescriba.
-- **Minimización de datos personales:** la auditoría no guarda el nombre, solo lo necesario para el patrón de acceso. Los logs registran método, ruta, status y duración; nunca bodies, nombres ni documentos.
+**Llaves de DynamoDB:** `pk = DOC#{documento}` y `sk = {createdAt ISO 8601 UTC}#{validationId}`. El patrón de acceso es "historial de un documento en un rango de fechas" (`Query` por `pk` con `sk BETWEEN`). ISO 8601 ordena cronológicamente como texto, y el sufijo `validationId` evita colisiones si dos eventos del mismo documento caen en el mismo milisegundo. El `PutItem` usa `attribute_not_exists(pk)` para que un evento nunca se sobrescriba.
+
+| Decisión                                                       | Alternativa descartada                  | Por qué                                                                                                                                                                                 |
+| -------------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Express 5 con inyección manual de dependencias                 | NestJS                                  | Dos endpoints no justifican un framework con DI; Express queda más cerca de un handler de Lambda y propaga errores async sin wrappers.                                                  |
+| API del Banco Mundial                                          | restcountries                           | La v3.1 fue retirada (responde siempre un error de deprecación) y la v5 exige API key; el Banco Mundial es gratuito, sin registro, y aporta nombre, región, capital y nivel de ingreso. |
+| Si la API externa falla, crear con `enrichment.status: failed` | Responder 502                           | La caída de un tercero no debe bloquear el negocio. Timeout y un reintento (300 ms) solo ante red, timeout, 5xx o 429.                                                                  |
+| Compensación: borrar en Mongo si la auditoría falla dos veces  | Transacción distribuida o patrón outbox | No hay transacción entre Mongo y Dynamo; la compensación garantiza que nunca quede una validación sin auditoría, sin agregar colas ni workers.                                          |
+| `sk = {ISO}#{validationId}`                                    | `sk` con solo la fecha del día          | Con solo la fecha, dos eventos del mismo documento en el mismo día se sobrescribirían en el `PutItem`.                                                                                  |
+| Query por `pk` sin GSI                                         | GSI por fecha o single table design     | El único patrón de acceso es por documento; un GSI sería costo sin consulta que lo use.                                                                                                 |
+| No guardar el nombre en la auditoría ni en los logs            | Auditar el registro completo            | Minimización de datos personales: la auditoría solo guarda lo necesario para el patrón de acceso, y los logs solo registran método, ruta, status y duración.                            |
 
 ## Verificar la auditoría
 
